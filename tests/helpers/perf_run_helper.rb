@@ -180,9 +180,14 @@ module PerfRunHelper
                "time_stamp" => Time.now,
                "avg_cpu" => @perf_result[0].avg_cpu,
                "avg_mem" => @perf_result[0].avg_mem,
-               "avg_dsk_write" => @perf_result[0].avg_disk_write,
+               "avg_disk_write" => @perf_result[0].avg_disk_write,
                "avg_response_time" => mean_response_time
            }]
+
+    process_hash = get_process_hash @perf_result[0]
+    row[0].merge! process_hash
+
+    logger.info "row is: #{row.to_s}"
 
     result = atop_table.insert row
     if result.success?
@@ -192,10 +197,28 @@ module PerfRunHelper
     end
   end
 
+  def get_process_hash perf_result
+    process_hash = {}
+    perf_result.processes.keys.each do |key|
+      # All of the puppet processes we care about are jars
+      process_match = @perf_result[0].processes[key][:cmd].match(/.*\/([a-z,\-]*)\.jar/)
+      unless process_match.nil?
+        process_name = process_match[1]
+        process_hash["process_#{process_name.gsub('-', '_')}_avg_cpu"] = @perf_result[0].processes[key][:avg_cpu]
+        process_hash["process_#{process_name.gsub('-', '_')}_avg_mem"] = @perf_result[0].processes[key][:avg_mem]
+      end
+    end
+    process_hash
+  end
+
   def get_baseline_result
     if BASELINE_PE_VER != nil
       #compare results created in this run with latest baseline run
-      sql = 'SELECT avg_cpu, avg_mem, avg_dsk_write, avg_response_time ' \
+      sql = 'SELECT avg_cpu, avg_mem, avg_disk_write, avg_response_time, ' \
+            'process_puppetdb_avg_cpu, process_puppetdb_avg_mem, ' \
+            'process_console_services_release_avg_cpu, process_console_services_release_avg_mem, ' \
+            'process_orchestration_services_release_avg_cpu, process_orchestration_services_release_avg_mem, ' \
+            'process_puppet_server_release_avg_cpu, process_puppet_server_release_avg_mem ' \
             'FROM `perf-metrics.perf_metrics.atop_metrics` ' \
             'WHERE time_stamp = (' \
           'SELECT MAX(time_stamp) ' \
@@ -210,21 +233,39 @@ module PerfRunHelper
       else
         logger.error("Cannot find result that matches query: #{sql}")
       end
-      BaselineResult.new(data)
+      data[0]
     else
       skip_test('Not comparing results with baseline as BASELINE_PE_VER was not set.')
     end
   end
 
-  class BaselineResult
-    attr_accessor :baseline_cpu, :baseline_memory, :baseline_dsk_write, :baseline_avg_resp_time
-    def initialize(data)
-      @baseline_cpu = data[0].fetch(:avg_cpu)
-      @baseline_memory = data[0].fetch(:avg_mem)
-      @baseline_dsk_write = data[0].fetch(:avg_dsk_write)
-      @baseline_avg_resp_time = data[0].fetch(:avg_response_time)
+  def baseline_assert atop_result, gatling_result
+    process_results = get_process_hash(atop_result)
+
+    # Handle 3 different things: avg_response_time which comes from gatling result,
+    # global atop results and per process atop results
+    baseline_result.each do |key, value|
+      if key.to_s == "avg_response_time"
+        assert_value = gatling_result.avg_response_time.to_f
+      elsif key.to_s.start_with? "process"
+        assert_value = process_results[key].to_f
+      else
+        assert_value = atop_result.send(key).to_f
+      end
+      assert_later((assert_value - value) / value * 100 <= 10, "The value of #{key} '#{assert_value}' " +
+          "was not within 10% of the baseline '#{value}'")
     end
   end
+
+  # class BaselineResult
+  #   attr_accessor :baseline_cpu, :baseline_memory, :baseline_dsk_write, :baseline_avg_resp_time
+  #   def initialize(data)
+  #     @baseline_cpu = data[0].fetch(:avg_cpu)
+  #     @baseline_memory = data[0].fetch(:avg_mem)
+  #     @baseline_dsk_write = data[0].fetch(:avg_dsk_write)
+  #     @baseline_avg_resp_time = data[0].fetch(:avg_response_time)
+  #   end
+  # end
 
 end
 
